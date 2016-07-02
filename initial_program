@@ -1,0 +1,519 @@
+#!/usr/bin/env python
+
+'''
+Initial program built on top of flux-capacitor
+Developed with simulating dynamic, hierarchical scheduling in mind
+'''
+
+import re
+import os
+import sys
+import imp
+import csv
+import time
+import json
+import Queue
+import syslog
+import argparse
+import subprocess
+import multiprocessing as mp
+
+import flux
+from flux._core import ffi
+
+local_handle = None
+parent_handle = None
+sim_handle = None
+
+def get_script_dir():
+    '''
+    Gets the directory of the script
+    (specifically the script launched at the command line,
+    not necessarily the current module)
+    '''
+    return os.path.dirname(os.path.realpath(sys.argv[0]))
+cap = imp.load_source('flux-capacitor',
+                      os.path.join(get_script_dir(), './flux-capacitor'))
+
+def load_sched_module(args):
+    ''' Load the sched module into the enclosing flux instance '''
+
+    load_cmd = ['flux', 'module', 'load', 'sched',
+                'in-sim=true',
+                'jobid={}'.format(args.local_jobid)]
+    if not args.root:
+        load_cmd.append('sim_uri={}'.format(args.sim_uri))
+    if not args.root and args.prefix:
+        load_cmd.append('prefix={}'.format(args.prefix))
+    if args.root and args.rdl:
+        load_cmd.append("rdl-conf={}".format(args.rdl))
+    if args.results:
+        load_cmd.append("resultsfolder={}".format(args.results))
+
+    print "Loading sched module: {}".format(load_cmd)
+    output = subprocess.check_output(load_cmd)
+    if len(output) > 0:
+        print output
+
+def load_sim_module():
+    ''' Loads the sim module into the enclosing flux instance '''
+
+    load_cmd = ['flux', 'module', 'load', 'sim', 'exit-on-complete=false']
+    print "Loading sim module: {}".format(load_cmd)
+    output = subprocess.check_output(load_cmd)
+    if len(output) > 0:
+        print output
+
+def load_exec_module(args):
+    ''' Loads the sim_exec module into the enclosing flux instance '''
+
+    load_cmd = ['flux', 'module', 'load', 'sim_exec',
+                'jobid={}'.format(args.local_jobid)]
+    if not args.root:
+        load_cmd.append('sim_uri={}'.format(args.sim_uri))
+    if not args.root and args.prefix:
+        load_cmd.append('prefix={}'.format(args.prefix))
+
+    print "Loading exec module: {}".format(load_cmd)
+    output = subprocess.check_output(load_cmd)
+    if len(output) > 0:
+        print output
+
+def load_timer_module(args):
+    ''' Loads the sim_timer module into the enclosing flux instance '''
+
+    load_cmd = ['flux', 'module', 'load', 'sim_timer',
+                'jobid={}'.format(args.local_jobid)]
+    if not args.root:
+        load_cmd.append('sim_uri={}'.format(args.sim_uri))
+    if not args.root and args.prefix:
+        load_cmd.append('prefix={}'.format(args.prefix))
+
+    print "Loading timer module: {}".format(load_cmd)
+    output = subprocess.check_output(load_cmd)
+    if len(output) > 0:
+        print output
+
+def load_modules(args):
+    ''' Loads all of the necessary modules into the enclosing flux instance '''
+
+    if args.root:
+        load_sim_module()
+    load_sched_module(args)
+    load_timer_module(args)
+    load_exec_module(args)
+
+def job_generator(args):
+    ''' Reads jobs in from hfile and yields them '''
+
+    with open(args.hfile, 'r') as infile:
+        reader = csv.DictReader(infile)
+        for line in reader:
+            timelimit = int(line['Timelimit'])
+            elapsed = int(line['Elapsed'])
+            runtime = min(timelimit, elapsed)
+            is_hierarchical = int(line['IsH'])
+            if is_hierarchical > 0:
+                cmd = ['flux', 'start',
+                       "{}".format(os.path.realpath(__file__)), line['Hfile']]
+                if args.log_dir:
+                    cmd.extend(['--log_dir', args.log_dir])
+                if args.results:
+                    cmd.extend(['-o', args.results])
+                cmd.extend(['child', args.sim_uri, str(args.full_jobid)])
+            else:
+                cmd = ['sleep', str(runtime)]
+            env = cap.get_environment()
+            env['FLUX_MODULE_PATH'] = os.environ['FLUX_MODULE_PATH']
+            env['FLUX_SCHED_RC_NOOP'] = os.environ['FLUX_SCHED_RC_NOOP']
+            new_job = cap.Job(cmd, nnodes=int(line['NNodes']),
+                              ntasks=int(line['NCPUS']),
+                              runtime=runtime, walltime=timelimit,
+                              environ=env,
+                              is_hierarchical=is_hierarchical)
+            yield new_job
+
+def stream_jobs(args, job_stream):
+    '''
+    Grabs jobs fromt the generator and puts them into job_stream
+    Will only start submitting jobs once job_,channel has a message in it
+    Will complete the job_channel task once the job_stream is full or we run out of jobs,
+         whichever comes first
+    '''
+
+    num_jobs = 0
+
+    # Submit jobs until the queue is full (i.e., the put fails) or
+    # we run out of jobs.  We use 'unsent_job' to determine which
+    # happened.
+    unsent_job = None
+    for job in job_generator(args):
+        try:
+            job_stream.put(job, True, 5)
+            num_jobs += 1
+        except Queue.Full:
+            unsent_job = job
+            break
+
+    # Signal that the first batch of jobs has been submitted
+    # At this point we have either filled the job_stream, or run out of jobs
+    #job_channel.task_done()
+
+    # Check if we still have jobs left to submit
+    if unsent_job:
+        # Submit all unsent jobs (blocking puts)
+        job_stream.put(unsent_job, True)
+        num_jobs += 1
+        for job in job_generator(args):
+            job_stream.put(job, True)
+            num_jobs += 1
+
+    job_stream.put("DONE")
+    job_stream.task_done() # for the above "DONE" msg
+
+    return num_jobs
+
+def xterm():
+    ''' Launches xterm '''
+    output = subprocess.check_output(["xterm"])
+    if len(output) > 0:
+        print output
+
+def start_sim():
+    ''' Sends a Flux RPC to start the simulation '''
+    local_handle.rpc_create("sim.starttoken")
+
+def join_sim(args):
+    ''' Sends a Flux RPC to join the simulation '''
+    rank = local_handle.get_rank()
+    local_uri = ffi.string(local_handle.flux_attr_get("local-uri", None))
+    payload = {
+        'mod_name' : 'init_prog.{}'.format(args.full_jobid),
+        'next_event' : -1,
+        'rank' : rank,
+        'uri' : local_uri
+    }
+    sim_handle.rpc_create("sim.join", payload=json.dumps(payload))
+
+def send_childbirth_msg(prog_args):
+    '''
+    Send an RPC to the parent instances letting it know that the child
+    (this instance) has completed its setup
+    '''
+    print "Sending childbirth message"
+    local_uri = ffi.string(local_handle.flux_attr_get("local-uri", None))
+    payload_str = json.dumps({'child-uri' : local_uri, "jobid" : prog_args.local_jobid})
+    parent_handle.rpc_create("sched.childbirth", payload=payload_str)
+
+def send_jobssubmitted_msg(num_jobs):
+    '''
+    Send an RPC to the scheduler that contains the number of jobs submitted
+    '''
+    payload_str = json.dumps({"count": num_jobs})
+    return local_handle.rpc_create("sched.alljobssubmitted", payload=payload_str)
+
+def send_simleave_msgs(args):
+    ''' Sends a Flux RPC to leave the simulation '''
+    print "Sending sim.leave messages"
+    for mod_prefix in ["sched", "sim_exec", "sim_timer"]:
+        mod_name = "{}.{}".format(mod_prefix, args.full_jobid)
+        payload_str = json.dumps({'mod_name' : mod_name})
+        local_handle.rpc_create("sim.leave", payload=payload_str)
+
+def send_death_msg(args):
+    ''' Sends a flux RPC to notify the parent scheduler of this instance's "death" '''
+    if args.root:
+        return
+
+    payload_str = json.dumps({'jobid' : args.local_jobid})
+    print "Sending sched.death message, payload: {}".format(payload_str)
+    parent_handle.rpc_create("sched.death", payload=payload_str)
+
+def send_reply_msg(args, message):
+    ''' Send Flux RPC in response to the sim's trigger '''
+
+    #payload_str = json.dumps({'mod_name' : "init_prog.{}".format(args.full_jobid)})
+    payload = message.payload
+    payload['mod_name'] = "init_prog.{}".format(args.full_jobid)
+    sim_handle.rpc_create('sim.reply', payload=json.dumps(payload))
+
+def trigger_cb(handle, typemask, message, args):
+    '''
+    Callback that is run when triggered by the simulation
+    Cleans up by removing all of the modules from this instance from the simulation
+    Also sends a death message to the parent instance
+    '''
+    print "Initial program {} was triggered".format(args.full_jobid)
+    send_simleave_msgs(args)
+    send_death_msg(args)
+    # TODO: fix racecondition
+    time.sleep(1)
+    send_reply_msg(args, message)
+    handle.reactor_stop(handle.get_reactor())
+
+class SimScheduler(cap.FluxScheduler):
+    '''
+    Scheduler made to run under the simulator.
+    Inherits from FluxScheduler, mainly overrides the check_feasibility method
+    '''
+
+    def __init__(self, *args, **kwargs):
+        super(SimScheduler, self).__init__(*args, **kwargs)
+
+    def check_feasibility(self, job):
+        ''' Override the feasibility check so that jobs are always submitted '''
+        pass
+
+    def schedule(self, job):
+        super(SimScheduler, self).schedule(job)
+
+        payload_str = json.dumps({'lwj':str(job.job_id)})
+        self.fh.event_send("jsc.state.submitted", payload=payload_str)
+
+    # TODO: update this to use the jsc interface
+    def state_change(self, key, state):
+        topic_regex = re.match(r'lwj.(\d*).state', key)
+        job_id = int(topic_regex.group(1))
+        self.jobs[job_id].state = state
+        if self.interface is not None:
+            self.interface.state_changed(self.jobs[job_id], state)
+        if state == 'running':
+            job = self.pending_jobs.pop(job_id, None)
+            if job is not None:
+                self.running_jobs[job_id] = job
+        if state == 'complete':
+            job = self.running_jobs.pop(job_id)
+            self.completed_jobs[job_id] = job
+            self.release_job_resources(job)
+        return 0
+
+
+class SimInterface(cap.UserInterface):
+    '''
+    Interact with the flux scheduler that is in sim mode
+    Add extra information to the KVS upon submission
+    Log job information upon completion
+    '''
+
+    fieldnames = ['id', 'nnodes', 'ntasks', 'starting_time', 'complete_time',
+                  'walltime', 'is_hierarchical']
+
+    def __init__(self, outstream, job_stream):
+        print "Initializing SimInterface"
+        self.writer_stream = outstream
+        self.writer = csv.DictWriter(outstream, self.fieldnames)
+        self.writer.writeheader()
+        self.stream = sys.stdout
+        self.job_stream = job_stream
+
+    def submitted(self, job):
+        '''
+        Runs after a job is submitted but before it is scheduled
+        Inserts sim-specific information into the KVS
+        '''
+        # TODO: add sim/hierarchical info to the kvs
+        job.kvs['execution_time'] = job.spec['runtime']
+        job.kvs['walltime'] = job.spec['walltime']
+        job.kvs['is_hierarchical'] = job.spec['is_hierarchical']
+        job.kvs.commit()
+        self.job_stream.task_done()
+
+    def state_changed(self, job, state):
+        '''
+        Runs after a job changes state
+        When a job completes, write out relavant job info to a file
+        '''
+        if state == 'complete':
+            # TODO: figure out why listing a kvsdir is not returning everything
+            rowdict = {}
+            for key in self.fieldnames:
+                try:
+                    rowdict[key] = job.kvs[key]
+                except KeyError:
+                    pass
+            rowdict['id'] = job.job_id
+            self.writer.writerow(rowdict)
+
+class Tee(object):
+    '''
+    Allows for printing to a file and flux's dmesg buffer simultaneously
+    Modeled after the Unix 'tee' comand
+    '''
+    def __init__(self, name, mode, buffering=None, flux_handle=None):
+        self.file = open(name, mode, buffering=buffering)
+        if buffering:
+            self.stdout = os.fdopen(sys.stdout.fileno(), 'w', buffering)
+        else:
+            self.stdout = sys.stdout
+        self.flux_handle = flux_handle
+        sys.stdout = self
+    def __del__(self):
+        sys.stdout = self.stdout
+        self.file.close()
+    def write(self, data):
+        self.file.write(data)
+        if self.flux_handle:
+            new_data = data.strip()
+            if len(new_data) > 0:
+                self.flux_handle.log(syslog.LOG_DEBUG, new_data)
+    def flush(self):
+        self.file.flush()
+
+def setup_logging(args, flux_handle=None):
+    '''
+    Replace sys.stdout with an instance of Tee
+    Also set the enclosing broker to write out its logs to a file
+    '''
+    if args.log_dir:
+        filename = os.path.join(args.log_dir, "{}-initprog.out".format(args.full_jobid))
+        Tee(filename, 'w', buffering=0, flux_handle=flux_handle)
+        if flux_handle:
+            flux_handle.log_set_appname("init_prog")
+    else:
+        sys.stdout = os.fdopen(sys.stdout.fileno(), 'w', 0)
+
+    setattr_cmd = ['flux', 'setattr', 'log-stderr-level', '7']
+    subprocess.check_output(setattr_cmd)
+    if args.log_dir:
+        log_filename = os.path.join(args.log_dir, "{}-broker.out".format(args.full_jobid))
+        setattr_cmd = ['flux', 'setattr', 'log-filename', log_filename]
+        subprocess.check_output(setattr_cmd)
+
+def parse_command_line():
+    ''' Parses and validates command line arguments '''
+
+    arg_parser = argparse.ArgumentParser()
+    arg_parser.add_argument('hfile',
+                            help="hierarchical job file")
+    arg_parser.add_argument('--results', '-o',
+                            help="directory to store the results in")
+    arg_parser.add_argument('--xterm', action='store_true',
+                            help='launch an interactive xterm')
+    arg_parser.add_argument('--log_dir', help="log stdout to a file (arg = directory)")
+
+    subparsers = arg_parser.add_subparsers()
+
+    root_parser = subparsers.add_parser('root')
+    root_parser.set_defaults(root=True, child=False,
+                             prefix=None)
+    root_parser.add_argument('--rdl', '-r',
+                             help="path to the rdl file")
+
+    sim_parser = subparsers.add_parser('child')
+    sim_parser.set_defaults(child=True, root=False)
+    sim_parser.add_argument('sim_uri',
+                            help="uri of the master sim module")
+    sim_parser.add_argument('prefix',
+                            help="sim name prefix, not including the id of "
+                            "this job (e.g. 4.2.5)")
+
+    args = arg_parser.parse_args()
+
+    if args.root:
+        args.local_jobid = 0
+        args.full_jobid = 0
+        args.sim_uri = os.environ['FLUX_URI']
+    else:
+        args.local_jobid = int(os.environ['FLUX_JOB_ID'])
+        args.full_jobid = "{}.{}".format(args.prefix, args.local_jobid)
+
+    # Command line argument validation
+    assert os.path.isfile(args.hfile)
+
+    if args.results:
+        assert os.path.isdir(args.results)
+    if args.root and args.rdl:
+        assert os.path.isfile(args.rdl)
+    if args.child and args.prefix:
+        for prefix_id in args.prefix.split('.'):
+            assert prefix_id.isdigit()
+
+    return args
+
+
+def main():
+    ''' Starts all 3 processes: reactor, sched, and job  '''
+
+    args = parse_command_line()
+
+    global local_handle
+    global sim_handle
+    global parent_handle
+    local_handle = flux.Flux()
+    if args.child:
+        parent_uri = local_handle.flux_attr_get("parent-uri", None)
+        parent_handle = flux.Flux(url=parent_uri)
+        sim_handle = flux.Flux(url=args.sim_uri)
+    else:
+        sim_handle = local_handle
+
+    setup_logging(args, local_handle)
+
+    print "Loading modules"
+    load_modules(args)
+
+    job_stream = mp.JoinableQueue(200)
+    state_stream = mp.Queue(10000)
+    watcher_stream = mp.JoinableQueue(200)
+
+    if args.xterm:
+        xterm_proc = mp.Process(target=xterm)
+        xterm_proc.start()
+
+    outfilename = os.path.join(args.results, "job-{}".format(args.full_jobid))
+    with open(outfilename, 'wb', 0) as outfile:
+        interface = SimInterface(outfile, job_stream)
+        sched = SimScheduler(watcher_stream, interface=interface)
+
+        # Process to respond to job events
+        reactor_proc = mp.Process(target=cap.event_reactor_proc,
+                                  args=(watcher_stream, state_stream))
+        reactor_proc.start()
+
+        # Process to run Flux-Capacitor's scheduler
+        sched_proc = mp.Process(target=cap.scheduler_proc,
+                                args=(job_stream, watcher_stream,
+                                      state_stream, sched))
+        sched_proc.start()
+
+        # Stream jobs to the scheduler
+        # TODO: implement online scheduling
+        num_jobs = stream_jobs(args, job_stream)
+        print "Waiting on jobs to be submitted"
+        job_stream.join()
+        time.sleep(1)
+
+        sched_rpc_req = send_jobssubmitted_msg(num_jobs)
+        join_sim(args)
+
+        if args.root:
+            print "Starting simulation"
+            start_sim()
+        else: # is a child
+            send_childbirth_msg(args)
+
+        trigger_topic = "init_prog.{}.trigger".format(args.full_jobid)
+        print "Registering watcher for '{}' requests".format(trigger_topic)
+        local_handle.event_subscribe(trigger_topic)
+        with local_handle.msg_watcher_create(trigger_cb,
+                                             type_mask=flux.FLUX_MSGTYPE_EVENT,
+                                             topic_glob=trigger_topic,
+                                             args=args) as msg_watch:
+            print "Entering reactor"
+            if local_handle.reactor_run(local_handle.get_reactor(), 0) < 0:
+                local_handle.fatal_error("reactor start failed!")
+
+        # Wait for all of the processes to finish
+        sched_proc.join()
+        reactor_proc.join()
+
+    # TODO: send death msg if child
+    if args.xterm:
+        xterm_proc.join()
+    print "All subprocesses shutdown"
+    print "initial program is done and exiting"
+
+if __name__ == "__main__":
+    main()
+
+
