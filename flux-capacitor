@@ -4,16 +4,12 @@ import re
 import sys
 import argparse
 import json
-import time
 import fileinput
-import itertools
 import collections
 import math
 import shlex
-import signal
 import select
 import Queue
-import subprocess as sp
 import multiprocessing as mp
 
 import flux
