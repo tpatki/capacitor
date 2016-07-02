@@ -14,7 +14,6 @@ import multiprocessing as mp
 
 import flux
 import flux.kvs as kvs
-import flux.kz as kz
 
 arg_parser = argparse.ArgumentParser(
     description="Execute a group of programs with the flux resource manager")
@@ -462,12 +461,6 @@ def event_reactor_proc(watch_stream, state_stream):
                 (job_id, tasks) = tup
                 kvs.watch(fh, 'lwj.{}.state'.format(job_id), job_state_change, None)
                 # TODO: generalize IO handling
-                for task_id in range(0, tasks):
-                    prefix = None
-                    if args.prefix:
-                        prefix = 'lwj.{}.{}: '.format(job_id, task_id)
-                    kz.attach(fh, 'lwj.{}.{}.stdout'.format(job_id, task_id), sys.stdout, prefix)
-                    kz.attach(fh, 'lwj.{}.{}.stderr'.format(job_id, task_id), sys.stderr, prefix)
 
                 watch_stream.task_done()
         except Queue.Empty:
