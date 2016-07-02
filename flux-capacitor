@@ -340,13 +340,15 @@ class UserInterface(object):
 
 
 
-def scheduler_proc(job_stream, watcher_stream, state_stream, finish):
+def scheduler_proc(job_stream, watcher_stream, state_stream, sched=None):
     ret = 0
-    interface = UserInterface()
-    if args.scheduler:
-        sched = FluxScheduler(watcher_stream, interface=interface)
-    else:
-        sched = CapScheduler(watcher_stream, interface=interface)
+    if sched is None:
+        if interface is None:
+            interface = UserInterface()
+        if args.scheduler:
+            sched = FluxScheduler(watcher_stream, interface=interface)
+        else:
+            sched = CapScheduler(watcher_stream, interface=interface)
     closed = False
     while not_done:
         reader_list = [  state_stream._reader ]
