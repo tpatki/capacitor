@@ -15,38 +15,12 @@ import multiprocessing as mp
 import flux
 import flux.kvs as kvs
 
-arg_parser = argparse.ArgumentParser(
-    description="Execute a group of programs with the flux resource manager")
-
-arg_parser.add_argument('--tasks', '-n', type=int, default=1)
-arg_parser.add_argument('--nodes', '-N', type=int, default=0)
-arg_parser.add_argument('--scheduler', '-S')
-arg_parser.add_argument('--prefix', '-P', help="Prefix output/err lines with the associated job id", action='store_true')
-
-
-arg_parser.add_argument(
-    '--command_file', '-c',
-    action='append',
-    default=[],
-    help='''Name of a file with one argument list per line, blank
-lines and lines where the first non-whitespace character is a # are ignored,
-all arguments accepted on the %(prog)s line are accepted in the file, may
-be specified multiple times''')
-
-try: 
+try:
     import cram
-    arg_parser.add_argument(
-        '--cram_file', '-C',
-        action='append',
-        default=[],
-        help='''Name of a command file created by the CRAM utility''')
 except ImportError:
     cram = False
 
-arg_parser.add_argument('command', nargs=argparse.REMAINDER)
-
-args = arg_parser.parse_args(sys.argv[1:])
-
+args = None
 
 not_done = True
 max_pending = 0
@@ -469,7 +443,35 @@ def event_reactor_proc(watch_stream, state_stream):
         fh.reactor_run(fh.get_reactor(), 0)
 
 
-if __name__ == "__main__":
+def main():
+    arg_parser = argparse.ArgumentParser(
+        description="Execute a group of programs with the flux resource manager")
+
+    arg_parser.add_argument('--tasks', '-n', type=int, default=1)
+    arg_parser.add_argument('--nodes', '-N', type=int, default=0)
+    arg_parser.add_argument('--scheduler', '-S')
+    arg_parser.add_argument('--prefix', '-P', help="Prefix output/err lines with the associated job id", action='store_true')
+
+    arg_parser.add_argument(
+        '--command_file', '-c',
+        action='append',
+        default=[],
+        help='''Name of a file with one argument list per line, blank
+        lines and lines where the first non-whitespace character is a # are ignored,
+        all arguments accepted on the %(prog)s line are accepted in the file, may
+        be specified multiple times''')
+
+    if cram:
+        arg_parser.add_argument(
+            '--cram_file', '-C',
+            action='append',
+            default=[],
+            help='''Name of a command file created by the CRAM utility''')
+    arg_parser.add_argument('command', nargs=argparse.REMAINDER)
+
+    global args
+    args = arg_parser.parse_args(sys.argv[1:])
+
     job_stream = mp.Queue(100)
     state_stream = mp.Queue(10000)
     watcher_stream = mp.JoinableQueue(100)
@@ -486,3 +488,5 @@ if __name__ == "__main__":
     sched_proc.join()
     reactor_proc.join()
 
+if __name__ == "__main__":
+    main()
