@@ -24,6 +24,7 @@ from flux._core import ffi
 local_handle = None
 parent_handle = None
 sim_handle = None
+ALL_MODS = ["sched", "sim_exec", "sim_timer", "init_prog"]
 
 def get_script_dir():
     '''
@@ -203,7 +204,7 @@ def send_childbirth_msg(prog_args):
     print "Sending childbirth message"
     local_uri = ffi.string(local_handle.flux_attr_get("local-uri", None))
     payload_str = json.dumps({'child-uri' : local_uri, "jobid" : prog_args.local_jobid})
-    parent_handle.rpc_create("sched.childbirth", payload=payload_str)
+    parent_handle.event_send("sched.childbirth", payload=payload_str)
 
 def send_jobssubmitted_msg(num_jobs):
     '''
@@ -215,10 +216,10 @@ def send_jobssubmitted_msg(num_jobs):
 def send_simleave_msgs(args):
     ''' Sends a Flux RPC to leave the simulation '''
     print "Sending sim.leave messages"
-    for mod_prefix in ["sched", "sim_exec", "sim_timer"]:
+    for mod_prefix in ALL_MODS:
         mod_name = "{}.{}".format(mod_prefix, args.full_jobid)
         payload_str = json.dumps({'mod_name' : mod_name})
-        local_handle.rpc_create("sim.leave", payload=payload_str)
+        sim_handle.rpc_create("sim.leave", payload=payload_str)
 
 def send_death_msg(args):
     ''' Sends a flux RPC to notify the parent scheduler of this instance's "death" '''
@@ -232,8 +233,22 @@ def send_death_msg(args):
 def send_reply_msg(args, message):
     ''' Send Flux RPC in response to the sim's trigger '''
 
-    #payload_str = json.dumps({'mod_name' : "init_prog.{}".format(args.full_jobid)})
     payload = message.payload
+
+    for mod_prefix in ALL_MODS:
+        mod_name = "{}.{}".format(mod_prefix, args.full_jobid)
+        payload['event_timers'][mod_name] = -1
+
+    if args.child:
+        parent_sched_mod = "sched.{}".format(args.prefix)
+        curr_event_time = payload['event_timers'][parent_sched_mod]
+        curr_sim_time = payload['sim_time']
+        if curr_event_time < 0:
+            next_event_time = 0.00001 + curr_sim_time
+        else:
+            next_event_time = min(0.00001 + curr_sim_time, curr_event_time)
+        payload['event_timers'][parent_sched_mod] = next_event_time
+
     payload['mod_name'] = "init_prog.{}".format(args.full_jobid)
     sim_handle.rpc_create('sim.reply', payload=json.dumps(payload))
 
@@ -248,6 +263,7 @@ def trigger_cb(handle, typemask, message, args):
     send_death_msg(args)
     # TODO: fix racecondition
     time.sleep(1)
+    # TODO: remove timers from reply
     send_reply_msg(args, message)
     handle.reactor_stop(handle.get_reactor())
 
