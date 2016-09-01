@@ -19,6 +19,7 @@ import subprocess
 import multiprocessing as mp
 
 import flux
+import flux.kvs as kvs
 from flux._core import ffi
 
 local_handle = None
@@ -340,6 +341,10 @@ class SimInterface(cap.UserInterface):
         When a job completes, write out relavant job info to a file
         '''
         if state == 'complete':
+            complete_key = 'lwj.{}.complete_time'.format(job.job_id)
+            while not kvs.exists(job.kvs.fh, complete_key):
+                print "{} kvs entry not found, waiting for it to be created".format(complete_key)
+                time.sleep(2)
             # TODO: figure out why listing a kvsdir is not returning everything
             rowdict = {}
             for key in self.fieldnames:
