@@ -51,6 +51,8 @@ def load_sched_module(args):
         load_cmd.append("rdl-conf={}".format(args.rdl))
     if args.results:
         load_cmd.append("resultsfolder={}".format(args.results))
+    if args.sched_plugin:
+        load_cmd.append("plugin={}".format(args.sched_plugin))
 
     print "Loading sched module: {}".format(load_cmd)
     output = subprocess.check_output(load_cmd)
@@ -122,6 +124,8 @@ def job_generator(args):
                     cmd.extend(['--log_dir', args.log_dir])
                 if args.results:
                     cmd.extend(['-o', args.results])
+                if args.sched_plugin:
+                    cmd.extend(['--sched_plugin', args.sched_plugin])
                 cmd.extend(['child', args.sim_uri, str(args.full_jobid)])
             else:
                 cmd = ['sleep', str(runtime)]
@@ -411,6 +415,7 @@ def parse_command_line():
     arg_parser.add_argument('--xterm', action='store_true',
                             help='launch an interactive xterm')
     arg_parser.add_argument('--log_dir', help="log stdout to a file (arg = directory)")
+    arg_parser.add_argument('--sched_plugin', help="which sched plugin to use")
 
     subparsers = arg_parser.add_subparsers()
 
