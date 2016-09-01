@@ -34,12 +34,11 @@ class Scheduler(object):
     """ A wrapper API for scheduler operations, mainly to stub out
     functionality that currently does not work without it."""
 
-    def __init__(self, watcher_stream, flux_handle = None, interface = None):
+    def __init__(self, flux_handle = None, interface = None):
         if flux_handle is None:
             flux_handle = flux.Flux()
         self.total_ranks = 0
         self.total_cores = 0
-        self.watcher_stream = watcher_stream
         self.interface = interface
         self.fh = flux_handle
         self.ranks = {}
@@ -91,8 +90,6 @@ class Scheduler(object):
         self.jobs[int(job.job_id)] = job
         jobdir = 'lwj.{}'.format(job.job_id)
         job.kvs = kvs.get_dir(self.fh, jobdir)
-        self.watcher_stream.put((job.job_id, job.spec['ntasks']))
-        self.watcher_stream.join()
         if self.interface is not None:
             self.interface.submitted(job)
         self.schedule(job)
@@ -137,8 +134,8 @@ class Scheduler(object):
 class FluxScheduler(Scheduler):
     """ Interact with the flux-sched module in the instance """
 
-    def __init__(self, watcher_stream, flux_handle = None, interface = None):
-        super(FluxScheduler, self).__init__(watcher_stream, flux_handle=flux_handle, interface = interface)
+    def __init__(self, flux_handle = None, interface = None):
+        super(FluxScheduler, self).__init__(flux_handle=flux_handle, interface = interface)
 
     def schedule(self, job):
         super(FluxScheduler, self).schedule(job)
@@ -147,12 +144,14 @@ class FluxScheduler(Scheduler):
         # interface
         job.kvs['state'] = 'submitted'
         job.kvs.commit()
+        payload_str = json.dumps({'lwj':str(job.job_id)})
+        self.fh.event_send("wreck.state.submitted", payload=payload_str)
 
 class SlurmScheduler(Scheduler):
     """ Interact with the flux-sched module in the instance """
 
-    def __init__(self, watcher_stream, flux_handle = None, interface = None):
-        super(SlurmScheduler, self).__init__(watcher_stream, flux_handle=flux_handle, interface = interface)
+    def __init__(self, flux_handle = None, interface = None):
+        super(SlurmScheduler, self).__init__(flux_handle=flux_handle, interface = interface)
 
     def schedule(self, job):
         super(SlurmScheduler, self).schedule(job)
@@ -164,8 +163,8 @@ class SlurmScheduler(Scheduler):
 
 class CapScheduler(Scheduler):
     """ Inner scheduler for testing while working on FluxScheduler support """
-    def __init__(self, watcher_stream, flux_handle = None, interface = None):
-        super(CapScheduler, self).__init__(watcher_stream, flux_handle=flux_handle, interface = interface)
+    def __init__(self, flux_handle = None, interface = None):
+        super(CapScheduler, self).__init__(flux_handle=flux_handle, interface = interface)
         self.partial_ranks = {}
 
     def schedule(self, job):
@@ -339,16 +338,15 @@ class UserInterface(object):
         print >> self.stream, "job submitted", job.job_id, "pending"
 
 
-
-def scheduler_proc(job_stream, watcher_stream, state_stream, sched=None):
+def scheduler_proc(job_stream, state_stream, sched=None):
     ret = 0
     if sched is None:
         if interface is None:
             interface = UserInterface()
         if args.scheduler:
-            sched = FluxScheduler(watcher_stream, interface=interface)
+            sched = FluxScheduler(interface=interface)
         else:
-            sched = CapScheduler(watcher_stream, interface=interface)
+            sched = CapScheduler(interface=interface)
     closed = False
     while not_done:
         reader_list = [  state_stream._reader, job_stream._reader ]
@@ -364,6 +362,7 @@ def scheduler_proc(job_stream, watcher_stream, state_stream, sched=None):
                     closed = True
                     continue
                 sched.submit(j)
+                job_stream.task_done()
             elif fd == state_stream._reader:
                 while True:
                     try:
@@ -380,7 +379,6 @@ def scheduler_proc(job_stream, watcher_stream, state_stream, sched=None):
         print "All jobs complete, exiting"
     else:
         print "Some jobs did not finish"
-    watcher_stream.put("DIE")
 
 depth = 0
 def run_args(cur_args, job_stream):
@@ -420,29 +418,20 @@ def command_supplier_proc(job_stream):
     run_args(args, job_stream)
     job_stream.put("DONE")
 
-def event_reactor_proc(watch_stream, state_stream):
+def event_reactor_proc(state_stream):
     fh = flux.Flux()
-    def job_state_change(key, value, scheduler, errnum):
-        if value == 'complete':
-            kvs.unwatch(fh, key)
+    def job_state_change(key, value):
         state_stream.put((key, value))
-    def add_watcher(inner_fh, watcher, fd_int, events, watcher_args):
-        if events & 4 == 4:
-            raise RuntimeError("IOError detected in event reactor")
-        try:
-            while True:
-                tup = watch_stream.get(False)
-                if tup == 'DIE':
-                    fh.reactor_stop(fh.get_reactor())
-                    break
-                (job_id, tasks) = tup
-                kvs.watch(fh, 'lwj.{}.state'.format(job_id), job_state_change, None)
-                # TODO: generalize IO handling
-
-                watch_stream.task_done()
-        except Queue.Empty:
-            pass
-    with flux.core.watchers.FDWatcher(fh, watch_stream._reader.fileno(), 3, add_watcher, watch_stream):
+    def state_change_cb(handle, typemask, message, args):
+        topic_regex = re.match(r'wreck.state.([a-zA-Z_]+)', message.topic)
+        state = topic_regex.group(1)
+        payload_json = json.loads(message.payload_str)
+        jobid = payload_json['lwj']
+        key = "lwj.{}.state".format(jobid)
+        value = state
+        job_state_change(key, value)
+    with fh.msg_watcher_create(state_change_cb, type_mask=flux.FLUX_MSGTYPE_EVENT,
+                               topic_glob="wreck.state.*"):
         fh.reactor_run(fh.get_reactor(), 0)
         print "Event reactor exited"
 
@@ -478,12 +467,11 @@ def main():
 
     job_stream = mp.Queue(100)
     state_stream = mp.Queue(10000)
-    watcher_stream = mp.JoinableQueue(100)
     finish = mp.Queue(1)
 
-    reactor_proc = mp.Process(target=event_reactor_proc, args=(watcher_stream, state_stream))
+    reactor_proc = mp.Process(target=event_reactor_proc, args=(state_stream))
     reactor_proc.start()
-    sched_proc = mp.Process(target=scheduler_proc, args=(job_stream, watcher_stream, state_stream, finish))
+    sched_proc = mp.Process(target=scheduler_proc, args=(job_stream, state_stream, finish))
     sched_proc.start()
     command_proc = mp.Process(target=command_supplier_proc, args=(job_stream,))
     command_proc.start()
