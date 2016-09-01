@@ -351,9 +351,10 @@ def scheduler_proc(job_stream, watcher_stream, state_stream, sched=None):
             sched = CapScheduler(watcher_stream, interface=interface)
     closed = False
     while not_done:
-        reader_list = [  state_stream._reader ]
-        if len(sched.pending_jobs) < 100:
-            reader_list.append(job_stream._reader)
+        reader_list = [  state_stream._reader, job_stream._reader ]
+        # TODO: re-enable this
+        #if len(sched.pending_jobs) < 100:
+        #reader_list.append(job_stream._reader)
 
         to_read, [], [] = select.select(reader_list, [], [])
         for fd in to_read:
@@ -443,6 +444,7 @@ def event_reactor_proc(watch_stream, state_stream):
             pass
     with flux.core.watchers.FDWatcher(fh, watch_stream._reader.fileno(), 3, add_watcher, watch_stream):
         fh.reactor_run(fh.get_reactor(), 0)
+        print "Event reactor exited"
 
 
 def main():
