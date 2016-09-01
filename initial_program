@@ -126,6 +126,9 @@ def job_generator(args):
                     cmd.extend(['-o', args.results])
                 if args.sched_plugin:
                     cmd.extend(['--sched_plugin', args.sched_plugin])
+                if args.redirect_script:
+                    log_path = os.path.join(args.log_dir, "stdout_err-{}".format(args.full_jobid))
+                    cmd = [args.redirect_script, log_path] + cmd + ['--redirect_script', args.redirect_script]
                 cmd.extend(['child', args.sim_uri, str(args.full_jobid)])
             else:
                 cmd = ['sleep', str(runtime)]
@@ -332,6 +335,7 @@ class SimInterface(cap.UserInterface):
         Runs after a job is submitted but before it is scheduled
         Inserts sim-specific information into the KVS
         '''
+        print "adding job {}".format(job.kvs['cmdline'])
         # TODO: add sim/hierarchical info to the kvs
         job.kvs['execution_time'] = job.spec['runtime']
         job.kvs['walltime'] = job.spec['walltime']
@@ -397,8 +401,6 @@ def setup_logging(args, flux_handle=None):
     else:
         sys.stdout = os.fdopen(sys.stdout.fileno(), 'w', 0)
 
-    setattr_cmd = ['flux', 'setattr', 'log-stderr-level', '7']
-    subprocess.check_output(setattr_cmd)
     if args.log_dir:
         log_filename = os.path.join(args.log_dir, "{}-broker.out".format(args.full_jobid))
         setattr_cmd = ['flux', 'setattr', 'log-filename', log_filename]
@@ -416,6 +418,7 @@ def parse_command_line():
                             help='launch an interactive xterm')
     arg_parser.add_argument('--log_dir', help="log stdout to a file (arg = directory)")
     arg_parser.add_argument('--sched_plugin', help="which sched plugin to use")
+    arg_parser.add_argument('--redirect_script', help="path to the bash script to redirect stdout/stderr")
 
     subparsers = arg_parser.add_subparsers()
 
@@ -527,7 +530,7 @@ def main():
                                              args=args) as msg_watch:
             print "Entering reactor"
             if local_handle.reactor_run(local_handle.get_reactor(), 0) < 0:
-                local_handle.fatal_error("reactor start failed!")
+                local_handle.fatal_error("init_prog.main", "reactor start failed!")
 
         # Wait for all of the processes to finish
         sched_proc.join()
