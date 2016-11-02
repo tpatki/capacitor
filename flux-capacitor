@@ -13,7 +13,10 @@ import Queue
 import multiprocessing as mp
 
 import flux
+import flux.core.watchers as watchers
 import flux.kvs as kvs
+import flux.jsc as jsc
+from flux._core import ffi
 
 try:
     import cram
@@ -106,7 +109,7 @@ class Scheduler(object):
             self.schedule(j)
 
     def state_change(self, key, state):
-        # print "received state change to: '{}'".format(state), key, state, state == 'complete'
+        print "received state change to: '{}'".format(state), key, state, state == 'complete'
         m = re.match('lwj.(\d*).state', key)
         job_id = int(m.group(1))
         self.jobs[job_id].state = state
@@ -142,10 +145,8 @@ class FluxScheduler(Scheduler):
         self.pending_jobs[int(job.job_id)] = job
         # TODO: this should be subsumed by a job submission and event
         # interface
-        job.kvs['state'] = 'submitted'
-        job.kvs.commit()
-        payload_str = json.dumps({'lwj':str(job.job_id)})
-        self.fh.event_send("wreck.state.submitted", payload=payload_str)
+        jcb = { jsc.JSC_STATE_PAIR : { jsc.JSC_STATE_PAIR_NSTATE : jsc.J_SUBMITTED }}
+        jsc.update_jcb(self.fh, job.job_id, jsc.JSC_STATE_PAIR, json.dumps(jcb))
 
 class SlurmScheduler(Scheduler):
     """ Interact with the flux-sched module in the instance """
@@ -372,11 +373,12 @@ def scheduler_proc(job_stream, state_stream, sched=None):
                         break
             else:
                 raise RuntimeError("Unknown stream returned from select")
+        print "Pending jobs: {}, running jobs: {}, completed jobs: {}".format(len(sched.pending_jobs), len(sched.running_jobs), len(sched.completed_jobs))
         if len(sched.pending_jobs) == len(sched.running_jobs) == 0 and closed:
             break
 
     if len(sched.pending_jobs) + len(sched.running_jobs) == 0:
-        print "All jobs complete, exiting"
+        print "All jobs complete, exiting scheduler_proc"
     else:
         print "Some jobs did not finish"
 
@@ -418,23 +420,28 @@ def command_supplier_proc(job_stream):
     run_args(args, job_stream)
     job_stream.put("DONE")
 
-def event_reactor_proc(state_stream):
+def event_reactor_proc(in_stream, state_stream):
     fh = flux.Flux()
     def job_state_change(key, value):
         state_stream.put((key, value))
-    def state_change_cb(handle, typemask, message, args):
-        topic_regex = re.match(r'wreck.state.([a-zA-Z_]+)', message.topic)
-        state = topic_regex.group(1)
-        payload_json = json.loads(message.payload_str)
-        jobid = payload_json['lwj']
+    def jsc_cb(jcb_str, arg, errnum):
+        jcb = json.loads(jcb_str)
+        nstate = jcb[jsc.JSC_STATE_PAIR][jsc.JSC_STATE_PAIR_NSTATE]
+        jobid = jcb['jobid']
         key = "lwj.{}.state".format(jobid)
-        value = state
+        value = jsc.job_num2state(nstate)
         job_state_change(key, value)
-    with fh.msg_watcher_create(state_change_cb, type_mask=flux.FLUX_MSGTYPE_EVENT,
-                               topic_glob="wreck.state.*"):
-        fh.reactor_run(fh.get_reactor(), 0)
-        print "Event reactor exited"
-
+    def stop_cb(fh, watcher, fd_int, revents, stream):
+        print "reactor proc received msg on stream: {}".format(stream.get())
+        fh.reactor_stop(fh.get_reactor())
+    print "Registering callback with JSC"
+    jsc.notify_status(fh, jsc_cb, state_stream)
+    with flux.core.watchers.FDWatcher(fh, in_stream._reader.fileno(), flux.FLUX_POLLIN,
+                        stop_cb, in_stream) as fd_watch:
+        print "Starting event reactor"
+        if fh.reactor_run(fh.get_reactor(), 0) < 0:
+            fh.fatal_error("event_reactor_proc", "reactor run failed")
+    print "Event reactor exited"
 
 def main():
     arg_parser = argparse.ArgumentParser(

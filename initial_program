@@ -12,6 +12,7 @@ import imp
 import csv
 import time
 import json
+import errno
 import Queue
 import syslog
 import argparse
@@ -221,7 +222,7 @@ def send_reply_msg(args, message):
 
     for mod_prefix in ALL_MODS:
         mod_name = "{}.{}".format(mod_prefix, args.full_jobid)
-        payload['event_timers'][mod_name] = -1
+        del payload['event_timers'][mod_name] #= -1
 
     if args.child:
         parent_sched_mod = "sched.{}".format(args.prefix)
@@ -243,6 +244,7 @@ def trigger_cb(handle, typemask, message, args):
     Also sends a death message to the parent instance
     '''
     print "Initial program {} was triggered".format(args.full_jobid)
+    time.sleep(1)
     send_simleave_msgs(args)
     send_death_msg(args)
     # TODO: fix racecondition
@@ -319,11 +321,22 @@ class SimInterface(cap.UserInterface):
         Runs after a job changes state
         When a job completes, write out relavant job info to a file
         '''
+        def try_key_exists(fh, key):
+            key_exists = kvs.exists(fh, key)
+            return key_exists
+
+        def try_get_dir(fh, key):
+            kvs_dir = kvs.get_dir(fh, key)
+            return kvs_dir
+
         if state == 'complete':
-            complete_key = 'lwj.{}.complete_time'.format(job.job_id)
-            while not kvs.exists(job.kvs.fh, complete_key):
+            jobdir_key = 'lwj.{}'.format(job.job_id)
+            complete_key = '{}.complete_time'.format(jobdir_key)
+            print "Looking for kvs entry {}, since job {} completed".format(complete_key, job.job_id)
+            while not try_key_exists(job.kvs.fh, complete_key):
                 print "{} kvs entry not found, waiting for it to be created".format(complete_key)
-                time.sleep(2)
+                time.sleep(1)
+            job.kvs = try_get_dir(job.kvs.fh, jobdir_key)
             # TODO: figure out why listing a kvsdir is not returning everything
             rowdict = {}
             for key in self.fieldnames:
@@ -453,6 +466,7 @@ def main():
     load_modules(args)
 
     state_stream = mp.Queue(10000)
+    reactor_stream = mp.Queue(1)
     job_stream = mp.JoinableQueue()
 
     if args.xterm:
@@ -462,12 +476,16 @@ def main():
     outfilename = os.path.join(args.results, "job-{}".format(args.full_jobid))
     with open(outfilename, 'wb', 0) as outfile:
         interface = SimInterface(outfile)
-        sched = SimScheduler(flux_handle=local_handle, interface=interface)
+        #sched = SimScheduler(flux_handle=local_handle, interface=interface)
+        sched = SimScheduler(flux_handle=None, interface=interface)
 
         # Process to process to job events
         reactor_proc = mp.Process(target=cap.event_reactor_proc,
-                                  args=(state_stream,))
+                                  args=(reactor_stream, state_stream))
         reactor_proc.start()
+
+        #TODO: unnecessary?
+        time.sleep(1)
 
         # Process to run Flux-Capacitor's scheduler
         sched_proc = mp.Process(target=cap.scheduler_proc,
@@ -500,10 +518,14 @@ def main():
                                              args=args) as msg_watch:
             print "Entering reactor"
             if local_handle.reactor_run(local_handle.get_reactor(), 0) < 0:
+                print "reactor start failed"
                 local_handle.fatal_error("init_prog.main", "reactor start failed!")
 
+        print "Exited reactor"
         # Wait for all of the processes to finish
         sched_proc.join()
+        print "Sending DONE to reactor proc via reactor stream"
+        reactor_stream.put("DONE")
         reactor_proc.join()
 
     # TODO: send death msg if child
